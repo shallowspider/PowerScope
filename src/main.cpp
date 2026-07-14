@@ -29,11 +29,15 @@
 #include <wbemidl.h>
 #include <oleauto.h>
 
+#include <fcntl.h>
+#include <io.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -123,13 +127,46 @@ std::wstring FormatMaybe(double value, int precision = 1) {
     return out.str();
 }
 
-void EnableVirtualTerminal() {
+bool g_virtual_terminal_enabled = false;
+
+void InitializeConsoleOutput() {
+    // MSVC wide streams are not reliably Unicode-capable on every Windows
+    // terminal unless stdout/stderr are explicitly switched to UTF-16 mode.
+    // Without this, the first Chinese character can set failbit on std::wcout,
+    // leaving the terminal blank while CSV logging continues normally.
+    _setmode(_fileno(stdout), _O_U16TEXT);
+    _setmode(_fileno(stderr), _O_U16TEXT);
+
     HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
     if (output == INVALID_HANDLE_VALUE || output == nullptr) return;
+
     DWORD mode = 0;
-    if (GetConsoleMode(output, &mode)) {
-        SetConsoleMode(output, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    if (GetConsoleMode(output, &mode) &&
+        SetConsoleMode(output, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+        g_virtual_terminal_enabled = true;
     }
+}
+
+void ClearConsoleScreen() {
+    if (g_virtual_terminal_enabled) {
+        std::wcout << L"\x1b[2J\x1b[H";
+        return;
+    }
+
+    // Fallback for hosts that do not support ANSI/VT sequences.
+    HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (output == INVALID_HANDLE_VALUE || output == nullptr) return;
+
+    CONSOLE_SCREEN_BUFFER_INFO info{};
+    if (!GetConsoleScreenBufferInfo(output, &info)) return;
+
+    const DWORD cell_count = static_cast<DWORD>(info.dwSize.X) *
+        static_cast<DWORD>(info.dwSize.Y);
+    const COORD home{0, 0};
+    DWORD written = 0;
+    FillConsoleOutputCharacterW(output, L' ', cell_count, home, &written);
+    FillConsoleOutputAttribute(output, info.wAttributes, cell_count, home, &written);
+    SetConsoleCursorPosition(output, home);
 }
 
 struct Options {
@@ -910,10 +947,11 @@ void PrintDashboard(const Options& options, const std::wstring& scheme,
     const ProcessSampleResult& processes, const NetworkReading& network,
     const DisplayReading& display, const std::vector<std::wstring>& diagnosis,
     const std::filesystem::path& csv_path) {
-    if (options.clear_screen) std::wcout << L"\x1b[2J\x1b[H";
+    if (!std::wcout.good()) std::wcout.clear();
+    if (options.clear_screen) ClearConsoleScreen();
     else std::wcout << L"\n============================================================\n";
 
-    std::wcout << L"PowerScope 0.1   " << NowLocalText()
+    std::wcout << L"PowerScope 0.2   " << NowLocalText()
                << L"   采样 " << options.interval_ms << L" ms   Ctrl+C 退出\n";
     std::wcout << L"数据标签：[实测] 硬件/系统直接报告  [指标] 活动程度  [状态] 配置状态\n";
     std::wcout << L"------------------------------------------------------------\n";
@@ -1006,12 +1044,14 @@ void PrintDashboard(const Options& options, const std::wstring& scheme,
 int wmain(int argc, wchar_t** argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
-    EnableVirtualTerminal();
+    InitializeConsoleOutput();
     SetConsoleCtrlHandler(ConsoleHandler, TRUE);
 
     const auto parsed = ParseOptions(argc, argv);
     if (!parsed) return argc > 1 ? 0 : 1;
     const Options options = *parsed;
+
+    std::wcout << L"PowerScope 正在初始化监测器，请稍候……" << std::flush;
 
     CpuSampler cpu_sampler;
     ProcessSampler process_sampler(cpu_sampler.LogicalProcessors());
