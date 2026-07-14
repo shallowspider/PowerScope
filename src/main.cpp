@@ -39,13 +39,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <deque>
-#include <filesystem>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -81,31 +80,11 @@ uint64_t FileTimeToU64(const FILETIME& value) {
     return u.QuadPart;
 }
 
-std::string WideToUtf8(const std::wstring& value) {
-    if (value.empty()) return {};
-    const int required = WideCharToMultiByte(CP_UTF8, 0, value.data(),
-        static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
-    if (required <= 0) return {};
-    std::string result(static_cast<size_t>(required), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
-        result.data(), required, nullptr, nullptr);
-    return result;
-}
-
 std::wstring NowLocalText() {
     SYSTEMTIME st{};
     GetLocalTime(&st);
     wchar_t buffer[64]{};
     swprintf_s(buffer, std::size(buffer), L"%04u-%02u-%02u %02u:%02u:%02u",
-        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    return buffer;
-}
-
-std::wstring TimestampForFilename() {
-    SYSTEMTIME st{};
-    GetLocalTime(&st);
-    wchar_t buffer[64]{};
-    swprintf_s(buffer, std::size(buffer), L"%04u%02u%02u_%02u%02u%02u",
         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
     return buffer;
 }
@@ -133,7 +112,7 @@ void InitializeConsoleOutput() {
     // MSVC wide streams are not reliably Unicode-capable on every Windows
     // terminal unless stdout/stderr are explicitly switched to UTF-16 mode.
     // Without this, the first Chinese character can set failbit on std::wcout,
-    // leaving the terminal blank while CSV logging continues normally.
+    // leaving the terminal blank even though background sampling continues normally.
     _setmode(_fileno(stdout), _O_U16TEXT);
     _setmode(_fileno(stderr), _O_U16TEXT);
 
@@ -147,35 +126,141 @@ void InitializeConsoleOutput() {
     }
 }
 
-void ClearConsoleScreen() {
-    if (g_virtual_terminal_enabled) {
-        std::wcout << L"\x1b[2J\x1b[H";
-        return;
-    }
-
-    // Fallback for hosts that do not support ANSI/VT sequences.
+void SetConsoleCursorVisible(bool visible) {
     HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
     if (output == INVALID_HANDLE_VALUE || output == nullptr) return;
-
-    CONSOLE_SCREEN_BUFFER_INFO info{};
-    if (!GetConsoleScreenBufferInfo(output, &info)) return;
-
-    const DWORD cell_count = static_cast<DWORD>(info.dwSize.X) *
-        static_cast<DWORD>(info.dwSize.Y);
-    const COORD home{0, 0};
-    DWORD written = 0;
-    FillConsoleOutputCharacterW(output, L' ', cell_count, home, &written);
-    FillConsoleOutputAttribute(output, info.wAttributes, cell_count, home, &written);
-    SetConsoleCursorPosition(output, home);
+    CONSOLE_CURSOR_INFO cursor{};
+    if (!GetConsoleCursorInfo(output, &cursor)) return;
+    cursor.bVisible = visible ? TRUE : FALSE;
+    SetConsoleCursorInfo(output, &cursor);
 }
+
+int DisplayCellWidth(wchar_t ch) {
+    const unsigned int c = static_cast<unsigned int>(ch);
+    if (c == 0) return 0;
+    if (c < 0x1100) return 1;
+    // Common East Asian wide/full-width ranges used by this dashboard.
+    if ((c >= 0x1100 && c <= 0x115F) ||
+        (c >= 0x2E80 && c <= 0xA4CF) ||
+        (c >= 0xAC00 && c <= 0xD7A3) ||
+        (c >= 0xF900 && c <= 0xFAFF) ||
+        (c >= 0xFE10 && c <= 0xFE19) ||
+        (c >= 0xFE30 && c <= 0xFE6F) ||
+        (c >= 0xFF01 && c <= 0xFF60) ||
+        (c >= 0xFFE0 && c <= 0xFFE6)) {
+        return 2;
+    }
+    return 1;
+}
+
+size_t DisplayWidth(const std::wstring& text) {
+    size_t width = 0;
+    for (wchar_t ch : text) width += static_cast<size_t>(DisplayCellWidth(ch));
+    return width;
+}
+
+std::wstring TruncateToWidth(const std::wstring& text, size_t width) {
+    if (DisplayWidth(text) <= width) return text;
+    if (width == 0) return {};
+    const std::wstring ellipsis = L"…";
+    const size_t target = width > 1 ? width - 1 : 0;
+    std::wstring result;
+    size_t used = 0;
+    for (wchar_t ch : text) {
+        const size_t cell = static_cast<size_t>(DisplayCellWidth(ch));
+        if (used + cell > target) break;
+        result.push_back(ch);
+        used += cell;
+    }
+    if (width >= 1) result += ellipsis;
+    return result;
+}
+
+std::wstring PadRightCells(std::wstring text, size_t width) {
+    text = TruncateToWidth(text, width);
+    const size_t used = DisplayWidth(text);
+    if (used < width) text.append(width - used, L' ');
+    return text;
+}
+
+std::wstring PadLeftCells(std::wstring text, size_t width) {
+    text = TruncateToWidth(text, width);
+    const size_t used = DisplayWidth(text);
+    if (used < width) text.insert(0, width - used, L' ');
+    return text;
+}
+
+class TerminalRenderer {
+public:
+    TerminalRenderer() {
+        output_ = GetStdHandle(STD_OUTPUT_HANDLE);
+        valid_ = output_ != INVALID_HANDLE_VALUE && output_ != nullptr;
+        if (!valid_) return;
+        SetConsoleCursorVisible(false);
+        WriteRaw(g_virtual_terminal_enabled ? L"\x1b[2J\x1b[H\x1b[?25l" : L"");
+        if (!g_virtual_terminal_enabled) {
+            CONSOLE_SCREEN_BUFFER_INFO info{};
+            if (GetConsoleScreenBufferInfo(output_, &info)) {
+                const DWORD cells = static_cast<DWORD>(info.dwSize.X) * static_cast<DWORD>(info.dwSize.Y);
+                DWORD written = 0;
+                FillConsoleOutputCharacterW(output_, L' ', cells, COORD{0, 0}, &written);
+                FillConsoleOutputAttribute(output_, info.wAttributes, cells, COORD{0, 0}, &written);
+                SetConsoleCursorPosition(output_, COORD{0, 0});
+            }
+        }
+    }
+
+    ~TerminalRenderer() {
+        if (!valid_) return;
+        if (g_virtual_terminal_enabled) WriteRaw(L"\x1b[?25h");
+        SetConsoleCursorVisible(true);
+    }
+
+    void Render(const std::vector<std::wstring>& lines) {
+        if (!valid_) return;
+        const int width = ConsoleWidth();
+        const size_t content_width = static_cast<size_t>(std::max(20, width - 1));
+        const size_t rows = std::max(previous_rows_, lines.size());
+
+        std::wstring frame;
+        frame.reserve(rows * (content_width + 1) + 16);
+        if (g_virtual_terminal_enabled) frame += L"\x1b[H";
+        else SetConsoleCursorPosition(output_, COORD{0, 0});
+
+        for (size_t i = 0; i < rows; ++i) {
+            const std::wstring line = i < lines.size() ? lines[i] : L"";
+            frame += PadRightCells(line, content_width);
+            if (i + 1 < rows) frame += L"\r\n";
+        }
+        if (g_virtual_terminal_enabled) frame += L"\x1b[J";
+        WriteRaw(frame);
+        previous_rows_ = lines.size();
+    }
+
+private:
+    int ConsoleWidth() const {
+        CONSOLE_SCREEN_BUFFER_INFO info{};
+        if (valid_ && GetConsoleScreenBufferInfo(output_, &info)) {
+            return std::max<int>(20, info.srWindow.Right - info.srWindow.Left + 1);
+        }
+        return 100;
+    }
+
+    void WriteRaw(const std::wstring& text) const {
+        if (!valid_ || text.empty()) return;
+        DWORD written = 0;
+        WriteConsoleW(output_, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
+    }
+
+    HANDLE output_ = INVALID_HANDLE_VALUE;
+    bool valid_ = false;
+    size_t previous_rows_ = 0;
+};
 
 struct Options {
     DWORD interval_ms = 1000;
     DWORD gpu_interval_ms = 5000;
-    bool clear_screen = true;
-    bool logging = true;
     bool gpu_enabled = true;
-    std::filesystem::path csv_path;
 };
 
 void PrintHelp() {
@@ -184,12 +269,9 @@ void PrintHelp() {
         << L"用法：PowerScope.exe [选项]\n\n"
         << L"  --interval-ms N       主采样间隔，默认 1000，最低 500\n"
         << L"  --gpu-interval-ms N   NVML 采样间隔，默认 5000，最低 1000\n"
-        << L"  --csv PATH            指定 CSV 日志路径\n"
-        << L"  --no-log              不写入 CSV\n"
-        << L"  --no-clear            不清屏，逐次向下输出\n"
-        << L"  --no-gpu              禁用 NVML，避免 GPU 监控本身影响独显休眠\n"
+        << L"  --no-gpu              禁用 NVML，避免 GPU 查询影响独显休眠\n"
         << L"  --help                 显示帮助\n\n"
-        << L"说明：电池供电时的“整机功耗”来自电池控制器；插电时 Windows 没有通用的整机输入功率接口。\n";
+        << L"说明：电池供电时的整机功耗来自电池控制器；插电时 Windows 没有通用的整机输入功率接口。\n";
 }
 
 std::optional<Options> ParseOptions(int argc, wchar_t** argv) {
@@ -217,14 +299,6 @@ std::optional<Options> ParseOptions(int argc, wchar_t** argv) {
             if (!v) return std::nullopt;
             try { options.gpu_interval_ms = std::max<DWORD>(1000, std::stoul(*v)); }
             catch (...) { std::wcerr << L"无效 GPU 采样间隔。\n"; return std::nullopt; }
-        } else if (arg == L"--csv") {
-            auto v = require_value(L"--csv");
-            if (!v) return std::nullopt;
-            options.csv_path = *v;
-        } else if (arg == L"--no-log") {
-            options.logging = false;
-        } else if (arg == L"--no-clear") {
-            options.clear_screen = false;
         } else if (arg == L"--no-gpu") {
             options.gpu_enabled = false;
         } else {
@@ -232,10 +306,6 @@ std::optional<Options> ParseOptions(int argc, wchar_t** argv) {
             PrintHelp();
             return std::nullopt;
         }
-    }
-
-    if (options.csv_path.empty()) {
-        options.csv_path = L"power_scope_" + TimestampForFilename() + L".csv";
     }
     return options;
 }
@@ -693,6 +763,44 @@ std::wstring ReadPowerSchemeName() {
     return result;
 }
 
+struct StaticSystemReading {
+    DisplayReading display;
+    std::wstring power_scheme = L"正在读取";
+};
+
+class StaticSystemSampler {
+public:
+    StaticSystemSampler() : worker_([this](std::stop_token stop) { Run(stop); }) {}
+
+    StaticSystemReading Get() const {
+        std::scoped_lock lock(mutex_);
+        return reading_;
+    }
+
+private:
+    void Run(std::stop_token stop) {
+        // WMI can occasionally block for hundreds of milliseconds. Keep these
+        // slow-changing probes off the main refresh loop so the dashboard stays smooth.
+        BrightnessReader brightness;
+        while (!stop.stop_requested()) {
+            StaticSystemReading next;
+            next.display = ReadDisplay(brightness);
+            next.power_scheme = ReadPowerSchemeName();
+            {
+                std::scoped_lock lock(mutex_);
+                reading_ = std::move(next);
+            }
+            for (int i = 0; i < 30 && !stop.stop_requested(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+    }
+
+    mutable std::mutex mutex_;
+    StaticSystemReading reading_;
+    std::jthread worker_;
+};
+
 // 仅声明本程序使用的 NVML ABI 子集，运行时从 NVIDIA 驱动自带的 nvml.dll 动态加载。
 using nvmlReturn_t = int;
 struct nvmlDevice_st;
@@ -841,70 +949,47 @@ private:
     GetUIntFn get_pstate_ = nullptr;
 };
 
-class RollingAverage {
+class PowerHistory {
 public:
-    explicit RollingAverage(size_t max_samples) : max_samples_(max_samples) {}
-    void Add(double value) {
-        if (!std::isfinite(value)) return;
-        values_.push_back(value);
-        while (values_.size() > max_samples_) values_.pop_front();
+    void Reset() { values_.clear(); }
+
+    void Add(Clock::time_point now, double value) {
+        if (!std::isfinite(value)) {
+            Prune(now);
+            return;
+        }
+        values_.emplace_back(now, value);
+        Prune(now);
     }
-    double Last(size_t count) const {
+
+    double Average(Clock::time_point now, std::chrono::seconds window) const {
         if (values_.empty()) return std::numeric_limits<double>::quiet_NaN();
-        const size_t start = values_.size() > count ? values_.size() - count : 0;
+        const auto threshold = now - window;
         double sum = 0.0;
-        for (size_t i = start; i < values_.size(); ++i) sum += values_[i];
-        return sum / static_cast<double>(values_.size() - start);
+        size_t count = 0;
+        for (auto it = values_.rbegin(); it != values_.rend(); ++it) {
+            if (it->first < threshold) break;
+            sum += it->second;
+            ++count;
+        }
+        return count == 0 ? std::numeric_limits<double>::quiet_NaN()
+                          : sum / static_cast<double>(count);
     }
+
+    int CoverageSeconds(Clock::time_point now) const {
+        if (values_.empty()) return 0;
+        return static_cast<int>(std::clamp(
+            std::chrono::duration_cast<std::chrono::seconds>(now - values_.front().first).count(),
+            static_cast<long long>(0), static_cast<long long>(60)));
+    }
+
 private:
-    size_t max_samples_;
-    std::deque<double> values_;
-};
-
-class CsvLogger {
-public:
-    bool Open(const std::filesystem::path& path) {
-        path_ = path;
-        file_.open(path, std::ios::binary | std::ios::out);
-        if (!file_) return false;
-        // UTF-8 BOM，便于中文版 Excel 正确识别。
-        file_ << "\xEF\xBB\xBF";
-        file_ << "timestamp,ac_online,battery_percent,battery_saver,system_draw_w,system_avg_5s_w,system_avg_30s_w,"
-                 "cpu_percent,cpu_average_mhz,cpu_limit_mhz,gpu_power_w,gpu_util_percent,gpu_memory_util_percent,"
-                 "gpu_temperature_c,gpu_graphics_mhz,gpu_memory_mhz,memory_used_percent,process_read_mib_s,"
-                 "process_write_mib_s,network_receive_mib_s,network_send_mib_s,brightness_percent,refresh_hz,hdr_enabled\n";
-        return true;
+    void Prune(Clock::time_point now) {
+        const auto threshold = now - std::chrono::seconds(60);
+        while (!values_.empty() && values_.front().first < threshold) values_.pop_front();
     }
 
-    void Write(const std::wstring& timestamp, const BatteryReading& battery,
-        double average_5s, double average_30s, const CpuReading& cpu,
-        const GpuReading& gpu, const MemoryReading& memory,
-        const ProcessSampleResult& processes, const NetworkReading& network,
-        const DisplayReading& display) {
-        if (!file_) return;
-        auto number = [](double v, int precision = 3) {
-            if (!std::isfinite(v)) return std::string{};
-            std::ostringstream out;
-            out << std::fixed << std::setprecision(precision) << v;
-            return out.str();
-        };
-        file_ << '"' << WideToUtf8(timestamp) << "\"," << (battery.ac_online ? 1 : 0) << ','
-              << battery.percent << ',' << (battery.saver ? 1 : 0) << ','
-              << number(battery.system_draw_w) << ',' << number(average_5s) << ',' << number(average_30s) << ','
-              << number(cpu.utilization) << ',' << number(cpu.average_mhz) << ',' << number(cpu.average_limit_mhz) << ','
-              << number(gpu.power_w) << ',' << gpu.utilization << ',' << gpu.memory_utilization << ','
-              << gpu.temperature_c << ',' << gpu.graphics_mhz << ',' << gpu.memory_mhz << ','
-              << number(memory.used_percent) << ',' << number(processes.total_read_mib_s) << ','
-              << number(processes.total_write_mib_s) << ',' << number(network.receive_mib_s) << ','
-              << number(network.send_mib_s) << ',' << display.brightness_percent << ','
-              << display.refresh_hz << ',' << (display.hdr_enabled ? 1 : 0) << '\n';
-        file_.flush();
-    }
-
-    const std::filesystem::path& Path() const { return path_; }
-private:
-    std::filesystem::path path_;
-    std::ofstream file_;
+    std::deque<std::pair<Clock::time_point, double>> values_;
 };
 
 std::vector<std::wstring> Diagnose(const BatteryReading& battery, const CpuReading& cpu,
@@ -913,130 +998,142 @@ std::vector<std::wstring> Diagnose(const BatteryReading& battery, const CpuReadi
     std::vector<std::wstring> messages;
     if (std::isfinite(battery.system_draw_w)) {
         if (battery.system_draw_w >= 40.0)
-            messages.emplace_back(L"严重：整机放电功耗超过 40 W，足以把 99.9 Wh 电池压缩到约 2.5 小时以内。 ");
+            messages.emplace_back(L"严重：整机放电功耗超过 40 W，99.9 Wh 电池续航通常不足约 2.5 小时。");
         else if (battery.system_draw_w >= 25.0)
-            messages.emplace_back(L"偏高：整机放电功耗超过 25 W，轻办公状态通常不应长期维持在此水平。 ");
+            messages.emplace_back(L"偏高：整机放电功耗超过 25 W，轻办公不应长期维持在此水平。");
         else if (battery.system_draw_w >= 17.0)
-            messages.emplace_back(L"注意：当前整机功耗偏高，建议观察 30 秒平均值和下列影响因子。 ");
+            messages.emplace_back(L"注意：当前整机功耗偏高，请结合 30/60 秒均值判断是否持续。");
     }
     if (gpu.data_available && std::isfinite(gpu.power_w)) {
         if (gpu.power_w >= 5.0 && gpu.utilization >= 0 && gpu.utilization <= 5)
-            messages.emplace_back(L"独显疑似空闲未休眠：GPU 利用率很低，但仍有明显功耗。 ");
+            messages.emplace_back(L"独显疑似空闲未休眠：利用率很低，但仍有明显功耗。");
         else if (gpu.power_w >= 10.0)
-            messages.emplace_back(L"RTX 独显当前贡献了较明显的功耗。 ");
+            messages.emplace_back(L"RTX 独显当前贡献了较明显的功耗。");
     }
     if (std::isfinite(cpu.utilization) && cpu.utilization >= 20.0)
-        messages.emplace_back(L"CPU 总占用持续偏高；查看进程排行定位后台任务。 ");
+        messages.emplace_back(L"CPU 总占用持续偏高；查看活跃进程排行定位后台任务。");
     if (display.brightness_percent >= 75)
-        messages.emplace_back(L"内屏亮度较高，是整机未归因功耗的重要来源。 ");
+        messages.emplace_back(L"内屏亮度较高，是整机未归因功耗的重要来源。");
     if (display.refresh_hz >= 120)
-        messages.emplace_back(L"屏幕处于高刷新率；续航测试时建议临时切换到 60 Hz 对比。 ");
+        messages.emplace_back(L"屏幕处于高刷新率；续航测试时建议切换到 60 Hz 对比。");
     if (display.hdr_enabled)
-        messages.emplace_back(L"HDR/高级颜色已开启，可能提高显示链路与背光功耗。 ");
+        messages.emplace_back(L"HDR/高级颜色已开启，可能提高显示链路与背光功耗。");
     if (processes.total_read_mib_s + processes.total_write_mib_s >= 10.0)
-        messages.emplace_back(L"进程磁盘 I/O 较高，可能造成 CPU、SSD 和后台服务持续活跃。 ");
+        messages.emplace_back(L"进程磁盘 I/O 较高，可能造成 CPU、SSD 和后台服务持续活跃。");
     if (network.receive_mib_s + network.send_mib_s >= 5.0)
-        messages.emplace_back(L"网络吞吐量较高，可能存在下载、同步、更新或代理流量。 ");
-    if (messages.empty()) messages.emplace_back(L"当前未命中明显异常阈值；应以 30 秒平均功耗和日志趋势为准。 ");
+        messages.emplace_back(L"网络吞吐量较高，可能存在下载、同步、更新或代理流量。");
+    if (messages.empty()) messages.emplace_back(L"当前未命中明显异常阈值；优先观察 30 秒和 60 秒平均功耗。");
     return messages;
 }
 
-void PrintDashboard(const Options& options, const std::wstring& scheme,
-    const BatteryReading& battery, double avg5, double avg30,
+std::wstring OnOff(bool value) { return value ? L"开" : L"关"; }
+
+std::wstring ValueOrNA(int value, const wchar_t* suffix = L"") {
+    return value >= 0 ? std::to_wstring(value) + suffix : L"N/A";
+}
+
+std::vector<std::wstring> BuildDashboard(const Options& options, const std::wstring& scheme,
+    const BatteryReading& battery, double avg5, double avg30, double avg60, int coverage_seconds,
     const CpuReading& cpu, const GpuReading& gpu, const MemoryReading& memory,
     const ProcessSampleResult& processes, const NetworkReading& network,
-    const DisplayReading& display, const std::vector<std::wstring>& diagnosis,
-    const std::filesystem::path& csv_path) {
-    if (!std::wcout.good()) std::wcout.clear();
-    if (options.clear_screen) ClearConsoleScreen();
-    else std::wcout << L"\n============================================================\n";
+    const DisplayReading& display, const std::vector<std::wstring>& diagnosis) {
+    std::vector<std::wstring> lines;
+    lines.reserve(24);
+    lines.emplace_back(L"PowerScope 0.3  |  " + NowLocalText() + L"  |  刷新 " +
+        std::to_wstring(options.interval_ms) + L" ms  |  Ctrl+C 退出");
+    lines.emplace_back(L"────────────────────────────────────────────────────────────────────────────────────────────");
 
-    std::wcout << L"PowerScope 0.2   " << NowLocalText()
-               << L"   采样 " << options.interval_ms << L" ms   Ctrl+C 退出\n";
-    std::wcout << L"数据标签：[实测] 硬件/系统直接报告  [指标] 活动程度  [状态] 配置状态\n";
-    std::wcout << L"------------------------------------------------------------\n";
-
-    std::wcout << L"【整机与电池】\n";
-    std::wcout << L"  电源：[状态] " << (battery.ac_online ? L"外接电源" : L"电池")
-               << L"   电量：" << (battery.percent >= 0 ? std::to_wstring(battery.percent) + L"%" : L"未知")
-               << L"   节电模式：" << (battery.saver ? L"开启" : L"关闭") << L"\n";
     if (std::isfinite(battery.system_draw_w)) {
-        std::wcout << L"  整机功耗：[实测·电池控制器] " << FormatMaybe(battery.system_draw_w) << L" W"
-                   << L"   5秒均值 " << FormatMaybe(avg5) << L" W"
-                   << L"   30秒均值 " << FormatMaybe(avg30) << L" W\n";
+        lines.emplace_back(L"整机 [实测]  " + FormatMaybe(battery.system_draw_w) + L" W   |   5秒 " +
+            FormatMaybe(avg5) + L" W   |   30秒 " + FormatMaybe(avg30) + L" W   |   60秒 " +
+            FormatMaybe(avg60) + L" W");
     } else if (battery.ac_online) {
-        std::wcout << L"  整机功耗：N/A（插电时公开 Windows API 无法测量适配器侧整机输入功率）\n";
-        if (std::isfinite(battery.signed_rate_w))
-            std::wcout << L"  电池充放电率：[实测] " << FormatMaybe(battery.signed_rate_w) << L" W（正值通常表示充电）\n";
+        std::wstring rate = std::isfinite(battery.signed_rate_w)
+            ? L"；电池充放电率 " + FormatMaybe(battery.signed_rate_w) + L" W" : L"";
+        lines.emplace_back(L"整机功耗 N/A：插电时公开 Windows API 无法测量适配器侧输入功率" + rate);
     } else {
-        std::wcout << L"  整机功耗：N/A（电池驱动未提供有效放电率）\n";
+        lines.emplace_back(L"整机功耗 N/A：电池驱动未提供有效放电率");
     }
-    std::wcout << L"  预计剩余：" << FormatDuration(battery.estimated_seconds)
-               << L"   剩余容量：" << FormatMaybe(battery.remaining_wh) << L" Wh"
-               << L"   报告最大容量：" << FormatMaybe(battery.max_wh) << L" Wh\n";
-    std::wcout << L"  电源方案：[状态] " << scheme << L"\n";
 
-    std::wcout << L"\n【CPU、内存与进程】\n";
-    std::wcout << L"  CPU：[指标] " << FormatMaybe(cpu.utilization) << L"%"
-               << L"   平均当前频率 " << FormatMaybe(cpu.average_mhz / 1000.0, 2) << L" GHz"
-               << L"   平均频率上限 " << FormatMaybe(cpu.average_limit_mhz / 1000.0, 2) << L" GHz\n";
-    std::wcout << L"  内存：[指标] " << FormatMaybe(memory.used_gib, 1) << L" / "
-               << FormatMaybe(memory.total_gib, 1) << L" GiB（" << FormatMaybe(memory.used_percent, 0) << L"%）\n";
-    std::wcout << L"  进程 I/O 合计：[指标] 读取 " << FormatMaybe(processes.total_read_mib_s, 2)
-               << L" MiB/s   写入 " << FormatMaybe(processes.total_write_mib_s, 2) << L" MiB/s\n";
-    std::wcout << L"  活跃进程（CPU 为整机总算力占比）：\n";
-    if (processes.top.empty()) {
-        std::wcout << L"    暂无明显活跃进程\n";
+    lines.emplace_back(L"电池  " + (battery.ac_online ? std::wstring(L"外接电源") : std::wstring(L"放电")) +
+        L"  |  电量 " + (battery.percent >= 0 ? std::to_wstring(battery.percent) + L"%" : L"未知") +
+        L"  |  预计 " + FormatDuration(battery.estimated_seconds) +
+        L"  |  剩余 " + FormatMaybe(battery.remaining_wh) + L" Wh  |  节电 " + OnOff(battery.saver));
+
+    lines.emplace_back(L"CPU   " + FormatMaybe(cpu.utilization) + L"%  |  频率 " +
+        FormatMaybe(cpu.average_mhz / 1000.0, 2) + L" / " +
+        FormatMaybe(cpu.average_limit_mhz / 1000.0, 2) + L" GHz  |  内存 " +
+        FormatMaybe(memory.used_gib, 1) + L" / " + FormatMaybe(memory.total_gib, 1) +
+        L" GiB (" + FormatMaybe(memory.used_percent, 0) + L"%)");
+
+    if (!options.gpu_enabled) {
+        lines.emplace_back(L"GPU   NVML 已禁用（--no-gpu），用于验证查询是否影响独显休眠");
+    } else if (!gpu.library_available) {
+        lines.emplace_back(L"GPU   未找到 NVIDIA NVML，请确认 NVIDIA 驱动已正确安装");
+    } else if (!gpu.device_available) {
+        lines.emplace_back(L"GPU   NVML 已加载，但未取得 NVIDIA GPU 句柄");
+    } else if (!gpu.data_available) {
+        lines.emplace_back(L"GPU   " + gpu.name + L"：无传感器数据，可能处于深度休眠");
     } else {
-        std::wcout << L"    " << std::left << std::setw(26) << L"进程"
-                   << std::right << std::setw(8) << L"CPU%"
-                   << std::setw(11) << L"读MiB/s" << std::setw(11) << L"写MiB/s" << L"\n";
-        for (const auto& p : processes.top) {
-            std::wstring name = p.name.size() > 24 ? p.name.substr(0, 23) + L"…" : p.name;
-            std::wcout << L"    " << std::left << std::setw(26) << name
-                       << std::right << std::setw(8) << FormatMaybe(p.cpu_percent, 1)
-                       << std::setw(11) << FormatMaybe(p.read_mib_s, 2)
-                       << std::setw(11) << FormatMaybe(p.write_mib_s, 2) << L"\n";
+        lines.emplace_back(L"GPU   " + gpu.name + L"  |  " + FormatMaybe(gpu.power_w) + L" W  |  利用率 " +
+            ValueOrNA(gpu.utilization, L"%") + L"  |  显存 " + ValueOrNA(gpu.memory_utilization, L"%") +
+            L"  |  " + ValueOrNA(gpu.temperature_c, L"°C") + L"  |  " +
+            ValueOrNA(gpu.graphics_mhz, L" MHz") + L" / " + ValueOrNA(gpu.memory_mhz, L" MHz") +
+            L"  |  P" + (gpu.pstate >= 0 ? std::to_wstring(gpu.pstate) : L"?"));
+    }
+
+    lines.emplace_back(L"显示  " + std::to_wstring(display.width) + L"×" + std::to_wstring(display.height) +
+        L" @ " + std::to_wstring(display.refresh_hz) + L" Hz  |  亮度 " +
+        ValueOrNA(display.brightness_percent, L"%") + L"  |  HDR " + OnOff(display.hdr_enabled) +
+        L"  |  活跃显示器 " + std::to_wstring(display.active_displays) + L"  |  方案 " + scheme);
+
+    lines.emplace_back(L"活动  网络 ↓" + FormatMaybe(network.receive_mib_s, 2) + L" ↑" +
+        FormatMaybe(network.send_mib_s, 2) + L" MiB/s  |  进程 I/O 读 " +
+        FormatMaybe(processes.total_read_mib_s, 2) + L" 写 " +
+        FormatMaybe(processes.total_write_mib_s, 2) + L" MiB/s");
+
+    lines.emplace_back(L"──────────────────────────────── 活跃进程 ────────────────────────────────");
+    lines.emplace_back(L"  " + PadRightCells(L"进程", 30) + PadLeftCells(L"PID", 8) +
+        PadLeftCells(L"CPU%", 9) + PadLeftCells(L"读 MiB/s", 13) + PadLeftCells(L"写 MiB/s", 13));
+
+    constexpr size_t kProcessRows = 6;
+    for (size_t i = 0; i < kProcessRows; ++i) {
+        if (i < processes.top.size()) {
+            const auto& p = processes.top[i];
+            lines.emplace_back(L"  " + PadRightCells(p.name, 30) +
+                PadLeftCells(std::to_wstring(p.pid), 8) +
+                PadLeftCells(FormatMaybe(p.cpu_percent, 1), 9) +
+                PadLeftCells(FormatMaybe(p.read_mib_s, 2), 13) +
+                PadLeftCells(FormatMaybe(p.write_mib_s, 2), 13));
+        } else {
+            lines.emplace_back(L"");
         }
     }
 
-    std::wcout << L"\n【RTX 独显】\n";
-    if (!options.gpu_enabled) {
-        std::wcout << L"  NVML 已禁用（--no-gpu）；适合验证监控本身是否影响独显休眠。\n";
-    } else if (!gpu.library_available) {
-        std::wcout << L"  未找到 NVIDIA NVML；请确认 NVIDIA 显卡驱动已正确安装。\n";
-    } else if (!gpu.device_available) {
-        std::wcout << L"  NVML 已加载，但没有取得 NVIDIA GPU 句柄。\n";
-    } else if (!gpu.data_available) {
-        std::wcout << L"  " << gpu.name << L"：当前无传感器数据，可能处于深度休眠或该指标不受支持。\n";
-    } else {
-        std::wcout << L"  " << gpu.name << L"\n";
-        std::wcout << L"  功耗：[实测·NVML] " << FormatMaybe(gpu.power_w) << L" W"
-                   << L"   利用率：[指标] " << (gpu.utilization >= 0 ? std::to_wstring(gpu.utilization) + L"%" : L"N/A")
-                   << L"   显存控制器 " << (gpu.memory_utilization >= 0 ? std::to_wstring(gpu.memory_utilization) + L"%" : L"N/A") << L"\n";
-        std::wcout << L"  温度 " << (gpu.temperature_c >= 0 ? std::to_wstring(gpu.temperature_c) + L"°C" : L"N/A")
-                   << L"   核心频率 " << (gpu.graphics_mhz >= 0 ? std::to_wstring(gpu.graphics_mhz) + L" MHz" : L"N/A")
-                   << L"   显存频率 " << (gpu.memory_mhz >= 0 ? std::to_wstring(gpu.memory_mhz) + L" MHz" : L"N/A")
-                   << L"   P" << (gpu.pstate >= 0 ? std::to_wstring(gpu.pstate) : L"?") << L"\n";
+    lines.emplace_back(L"──────────────────────────────── 自动判断 ────────────────────────────────");
+    constexpr size_t kDiagnosisRows = 4;
+    for (size_t i = 0; i < kDiagnosisRows; ++i) {
+        if (i < diagnosis.size()) {
+            if (i == kDiagnosisRows - 1 && diagnosis.size() > kDiagnosisRows) {
+                lines.emplace_back(L"  • " + diagnosis[i] + L"  （另有 " +
+                    std::to_wstring(diagnosis.size() - kDiagnosisRows) + L" 条）");
+            } else {
+                lines.emplace_back(L"  • " + diagnosis[i]);
+            }
+        } else {
+            lines.emplace_back(L"");
+        }
     }
 
-    std::wcout << L"\n【显示与网络】\n";
-    std::wcout << L"  显示：[状态] " << display.width << L"×" << display.height
-               << L" @ " << display.refresh_hz << L" Hz"
-               << L"   活跃显示器 " << display.active_displays
-               << L"   亮度 " << (display.brightness_percent >= 0 ? std::to_wstring(display.brightness_percent) + L"%" : L"N/A") << L"\n";
-    std::wcout << L"  HDR/高级颜色：[状态] "
-               << (display.hdr_enabled ? L"已开启" : (display.hdr_supported ? L"支持但未开启" : L"未检测到支持")) << L"\n";
-    std::wcout << L"  网络：[指标·物理网卡] 下载 " << FormatMaybe(network.receive_mib_s, 2)
-               << L" MiB/s   上传 " << FormatMaybe(network.send_mib_s, 2) << L" MiB/s\n";
-
-    std::wcout << L"\n【自动判断】\n";
-    for (const auto& message : diagnosis) std::wcout << L"  • " << message << L"\n";
-
-    if (options.logging) std::wcout << L"\nCSV 日志：" << csv_path.wstring() << L"\n";
-    if (options.gpu_enabled)
-        std::wcout << L"提示：NVML 查询在部分混合显卡笔记本上可能影响独显休眠；可用 --no-gpu 做对照测试。\n";
-    std::wcout.flush();
+    std::wstring footer = L"[实测] 传感器直接报告  [指标] 活动程度  [状态] 配置；";
+    if (coverage_seconds < 60 && std::isfinite(battery.system_draw_w)) {
+        footer += L"60秒均值预热 " + std::to_wstring(coverage_seconds) + L"/60 秒；";
+    }
+    footer += options.gpu_enabled
+        ? L"NVML 在部分混合显卡笔记本上可能唤醒独显，可用 --no-gpu 对照。"
+        : L"当前未查询 NVML。";
+    lines.emplace_back(std::move(footer));
+    return lines;
 }
 
 } // namespace
@@ -1056,74 +1153,65 @@ int wmain(int argc, wchar_t** argv) {
     CpuSampler cpu_sampler;
     ProcessSampler process_sampler(cpu_sampler.LogicalProcessors());
     NetworkSampler network_sampler;
-    BrightnessReader brightness_reader;
+    StaticSystemSampler static_system_sampler;
     NvmlSampler nvml_sampler;
-    RollingAverage power_average(std::max<size_t>(60,
-        static_cast<size_t>(60'000 / options.interval_ms + 2)));
+    PowerHistory power_history;
 
-    CsvLogger logger;
-    if (options.logging && !logger.Open(options.csv_path)) {
-        std::wcerr << L"无法创建 CSV 日志：" << options.csv_path.wstring() << L"\n";
-        return 2;
-    }
-
-    std::wstring power_scheme = ReadPowerSchemeName();
-    DisplayReading display = ReadDisplay(brightness_reader);
+    StaticSystemReading static_system = static_system_sampler.Get();
     GpuReading gpu;
     auto last_gpu_sample = Clock::now() - std::chrono::milliseconds(options.gpu_interval_ms);
-    auto last_static_refresh = Clock::now() - std::chrono::seconds(10);
-    auto last = Clock::now();
 
-    // 建立进程和网络基线。
+    // Establish process/network baselines before the dashboard starts.
     process_sampler.Sample(1.0);
     network_sampler.Sample(1.0);
     std::this_thread::sleep_for(std::chrono::milliseconds(options.interval_ms));
 
-    while (!g_stop.load()) {
-        const auto now = Clock::now();
-        double elapsed = std::chrono::duration<double>(now - last).count();
-        if (elapsed <= 0.0) elapsed = options.interval_ms / 1000.0;
-        last = now;
+    {
+        TerminalRenderer renderer;
+        auto last_sample = Clock::now();
+        auto next_tick = last_sample;
+        bool was_on_ac = false;
 
-        const BatteryReading battery = ReadBattery();
-        const CpuReading cpu = cpu_sampler.Sample();
-        const ProcessSampleResult processes = process_sampler.Sample(elapsed);
-        const NetworkReading network = network_sampler.Sample(elapsed);
-        const MemoryReading memory = ReadMemory();
+        while (!g_stop.load()) {
+            next_tick += std::chrono::milliseconds(options.interval_ms);
+            const auto cycle_start = Clock::now();
+            double elapsed = std::chrono::duration<double>(cycle_start - last_sample).count();
+            if (elapsed <= 0.0) elapsed = options.interval_ms / 1000.0;
+            last_sample = cycle_start;
 
-        if (options.gpu_enabled &&
-            now - last_gpu_sample >= std::chrono::milliseconds(options.gpu_interval_ms)) {
-            gpu = nvml_sampler.Sample();
-            last_gpu_sample = now;
-        }
-        if (now - last_static_refresh >= std::chrono::seconds(5)) {
-            display = ReadDisplay(brightness_reader);
-            power_scheme = ReadPowerSchemeName();
-            last_static_refresh = now;
-        }
+            const BatteryReading battery = ReadBattery();
+            const CpuReading cpu = cpu_sampler.Sample();
+            const ProcessSampleResult processes = process_sampler.Sample(elapsed);
+            const NetworkReading network = network_sampler.Sample(elapsed);
+            const MemoryReading memory = ReadMemory();
 
-        power_average.Add(battery.system_draw_w);
-        const size_t samples_5s = std::max<size_t>(1, 5000 / options.interval_ms);
-        const size_t samples_30s = std::max<size_t>(1, 30000 / options.interval_ms);
-        const double avg5 = power_average.Last(samples_5s);
-        const double avg30 = power_average.Last(samples_30s);
-        const auto diagnosis = Diagnose(battery, cpu, gpu, display, processes, network);
+            if (options.gpu_enabled &&
+                cycle_start - last_gpu_sample >= std::chrono::milliseconds(options.gpu_interval_ms)) {
+                gpu = nvml_sampler.Sample();
+                last_gpu_sample = cycle_start;
+            }
+            static_system = static_system_sampler.Get();
 
-        PrintDashboard(options, power_scheme, battery, avg5, avg30, cpu, gpu,
-            memory, processes, network, display, diagnosis, options.csv_path);
-        if (options.logging) {
-            logger.Write(NowLocalText(), battery, avg5, avg30, cpu, gpu,
-                memory, processes, network, display);
-        }
+            if (battery.ac_online && !was_on_ac) power_history.Reset();
+            was_on_ac = battery.ac_online;
+            if (!battery.ac_online) power_history.Add(cycle_start, battery.system_draw_w);
 
-        const auto target = now + std::chrono::milliseconds(options.interval_ms);
-        while (!g_stop.load() && Clock::now() < target) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            const double avg5 = power_history.Average(cycle_start, std::chrono::seconds(5));
+            const double avg30 = power_history.Average(cycle_start, std::chrono::seconds(30));
+            const double avg60 = power_history.Average(cycle_start, std::chrono::seconds(60));
+            const int coverage = power_history.CoverageSeconds(cycle_start);
+            const auto diagnosis = Diagnose(battery, cpu, gpu, static_system.display, processes, network);
+            renderer.Render(BuildDashboard(options, static_system.power_scheme, battery, avg5, avg30, avg60,
+                coverage, cpu, gpu, memory, processes, network, static_system.display, diagnosis));
+
+            const auto now = Clock::now();
+            if (next_tick <= now) next_tick = now;
+            while (!g_stop.load() && Clock::now() < next_tick) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
         }
     }
 
-    std::wcout << L"\n已停止监控。";
-    if (options.logging) std::wcout << L" 日志已保存到：" << options.csv_path.wstring();
-    std::wcout << L"\n";
+    std::wcout << L"\n已停止监控。\n";
     return 0;
 }

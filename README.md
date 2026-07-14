@@ -21,8 +21,9 @@
 - 内存占用
 - 屏幕分辨率、刷新率、亮度、HDR/高级颜色状态
 - 电源来源、电池百分比、节电模式、活动电源方案
-- 5 秒和 30 秒整机功耗平均值
-- 自动异常判断与 CSV 日志
+- 5 秒、30 秒和 60 秒整机功耗滑动平均值
+- 固定区域原地刷新，减少终端闪烁和错位
+- 自动异常判断（不生成日志文件）
 
 ## 它不会伪造什么
 
@@ -67,23 +68,20 @@ PowerScope.exe
 
 - 每 1 秒刷新终端；
 - 每 5 秒查询一次 NVML；
-- 在当前目录持续写入 `power_scope_日期_时间.csv`；
-- 按 `Ctrl+C` 正常停止并关闭日志。
+- 在固定终端区域内原地刷新，不滚屏、不生成日志文件；
+- 按 `Ctrl+C` 正常停止。
 
 常用选项：
 
 ```powershell
-# 禁止清屏，保留每次输出
-.\PowerScope.exe --no-clear
-
-# 不写日志
-.\PowerScope.exe --no-log
-
 # 禁用 NVIDIA NVML，验证监控本身是否影响独显休眠
 .\PowerScope.exe --no-gpu
 
-# 指定日志路径和采样间隔
-.\PowerScope.exe --interval-ms 2000 --csv "$env:USERPROFILE\Desktop\power-test.csv"
+# 将终端刷新间隔改为 2 秒
+.\PowerScope.exe --interval-ms 2000
+
+# 将 NVML 查询间隔改为 10 秒
+.\PowerScope.exe --gpu-interval-ms 10000
 ```
 
 ## 推荐测试流程
@@ -96,7 +94,7 @@ PowerScope.exe
 .\PowerScope.exe --no-gpu
 ```
 
-空闲 5 分钟，记录 30 秒平均整机功耗。
+空闲 5 分钟，观察 30 秒和 60 秒平均整机功耗。
 
 4. 再运行默认模式：
 
@@ -121,7 +119,7 @@ PowerScope.exe
 - 33 W ≈ 3 小时
 - 50 W ≈ 2 小时
 
-请优先看 **30 秒平均值**，不要只看瞬时功耗。
+请优先看 **30 秒和 60 秒平均值**，不要只看瞬时功耗。程序启动后的前 60 秒会用当前已有样本预热，并在终端显示进度。
 
 ## 已知限制
 
