@@ -42,18 +42,19 @@
    - Windows 11 SDK
    - CMake tools for Windows
 
-### 一键构建
+### 构建
 
 在 PowerShell 中进入项目目录后：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1
+cmake -S . -B build
+cmake --build build --config Release
 ```
 
-成功后项目根目录会出现：
+成功后可执行文件位于：
 
 ```text
-PowerScope.exe
+build\Release\PowerScope.exe
 ```
 
 程序静态链接 MSVC 运行库，通常无需另外安装 VC++ Runtime。
@@ -61,7 +62,7 @@ PowerScope.exe
 ## 运行
 
 ```powershell
-.\PowerScope.exe
+.\build\Release\PowerScope.exe
 ```
 
 默认行为：
@@ -69,19 +70,30 @@ PowerScope.exe
 - 每 1 秒刷新终端；
 - 每 5 秒查询一次 NVML；
 - 在固定终端区域内原地刷新，不滚屏、不生成日志文件；
+- 终端宽度达到 110 列时显示宽布局；更窄时自动切换为纵向分组；
+- 终端高度不足时优先保留功耗、核心资源和诊断，自动折叠部分进程；
+- 明确区分不可测量、当前不可用、已禁用和预热中的指标；
 - 按 `Ctrl+C` 正常停止。
 
 常用选项：
 
 ```powershell
 # 禁用 NVIDIA NVML，验证监控本身是否影响独显休眠
-.\PowerScope.exe --no-gpu
+.\build\Release\PowerScope.exe --no-gpu
 
 # 将终端刷新间隔改为 2 秒
-.\PowerScope.exe --interval-ms 2000
+.\build\Release\PowerScope.exe --interval-ms 2000
 
 # 将 NVML 查询间隔改为 10 秒
-.\PowerScope.exe --gpu-interval-ms 10000
+.\build\Release\PowerScope.exe --gpu-interval-ms 10000
+```
+
+### 运行测试
+
+```powershell
+cmake -S . -B build -DBUILD_TESTING=ON
+cmake --build build --config Debug --target PowerScopeTests
+ctest --test-dir build -C Debug --output-on-failure
 ```
 
 ## 推荐测试流程
@@ -91,7 +103,7 @@ PowerScope.exe
 3. 先运行：
 
 ```powershell
-.\PowerScope.exe --no-gpu
+.\build\Release\PowerScope.exe --no-gpu
 ```
 
 空闲 5 分钟，观察 30 秒和 60 秒平均整机功耗。
@@ -99,7 +111,7 @@ PowerScope.exe
 4. 再运行默认模式：
 
 ```powershell
-.\PowerScope.exe
+.\build\Release\PowerScope.exe
 ```
 
 比较整机功耗是否因 NVML 查询显著升高，并观察 RTX 5060 是否有持续功耗、频率和温度。
@@ -123,8 +135,8 @@ PowerScope.exe
 
 ## 已知限制
 
-- 某些电池驱动不报告实时 Rate，此时整机功耗显示 N/A。
+- 某些电池驱动不报告实时 Rate，此时整机功耗显示“当前不可用”。
 - NVML 指标是否可用由 NVIDIA 驱动、GPU 电源状态和笔记本固件决定。
 - 查询 NVML 在部分混合显卡笔记本上可能唤醒独显，因此程序提供 `--no-gpu` 对照模式。
-- WMI 亮度仅适用于支持 `WmiMonitorBrightness` 的内置显示器；外接显示器通常显示 N/A。
+- WMI 亮度仅适用于支持 `WmiMonitorBrightness` 的内置显示器；外接显示器通常显示“不可测量”。
 - 进程 I/O 是可访问进程的汇总，不等同于存储控制器的物理总吞吐量。
