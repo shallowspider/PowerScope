@@ -3,3 +3,5 @@ PowerScope.exe
 power_scope_*.csv
 *.user
 .vs/
+/.agents/
+/.codex/
