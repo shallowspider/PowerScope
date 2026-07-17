@@ -1,6 +1,6 @@
 # PowerScope
 
-专门面向 Windows 11 高性能笔记本的 C++20 终端耗能诊断器。当前配置重点适配：
+专门面向 Windows11 高性能笔记本的 C++20 整机功耗监测和诊断工具。当前配置重点适配：
 
 - Intel Core Ultra 平台
 - NVIDIA GeForce RTX Laptop GPU（通过驱动自带 NVML）
